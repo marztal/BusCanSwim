@@ -82,12 +82,14 @@ def list_operators():
 def list_routes(operator_id, line_number, days_back, filter_by_line=True):
     date_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     date_to = datetime.now().strftime("%Y-%m-%d")
+    # לא שולחים line_refs ל-API: זהו מזהה פנימי בבסיס הנתונים ולא מספר הקו הציבורי
+    # (route_short_name). מספר קו אחד (למשל 826) יכול להופיע עם כמה line_ref שונים.
+    # לכן שולפים לפי מפעיל+תאריכים בלבד, ומסננים בעצמנו לפי route_short_name.
     params = (
         ("operator_refs", str(operator_id)),
-        ("line_refs", str(line_number)),  # שם הפרמטר הנכון לפי תיעוד ה-API הוא ברבים
         ("date_from", date_from),
         ("date_to", date_to),
-        ("limit", 200),
+        ("limit", 1000),
     )
     data = api_get("/gtfs_routes/list", params)
 
@@ -95,14 +97,12 @@ def list_routes(operator_id, line_number, days_back, filter_by_line=True):
     for d in data:
         short_name = str(d.get("route_short_name", "")).strip()
         line_ref = str(d.get("line_ref", "")).strip()
-        if filter_by_line:
-            # סינון בצד הלקוח: ה-API לפעמים מתעלם מפילטר line_ref ומחזיר גם קווים אחרים,
-            # אז מוודאים בעצמנו שהקו תואם למה שביקשנו
-            if short_name != str(line_number).strip() and line_ref != str(line_number).strip():
-                continue
+        if filter_by_line and short_name != str(line_number).strip():
+            continue
         route_key = f'{d.get("line_ref")}-{d.get("route_mkt")}-#' if d.get("route_mkt") else d.get("route_short_name")
         routes.append({
             "route_key": route_key,
+            "line_ref": line_ref,
             "label": f'{short_name} (line_ref={line_ref}) | {d.get("route_long_name")} ({d.get("date")})',
             "raw": d,
         })
