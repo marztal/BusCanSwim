@@ -64,14 +64,23 @@ def api_get_live(path, params):
 
 def list_operators():
     data = api_get("/gtfs_agencies/list", (("limit", 200),))
-    ops = [{"operator_id": d.get("operator_ref"), "name": d.get("agency_name")} for d in data]
-    ops = [o for o in ops if o["operator_id"] is not None]
+    # יש רשומות היסטוריות כפולות לאותו operator_ref (למשל "אגד" מופיע כמה פעמים
+    # עם תאריכי תוקף שונים) - שומרים רק ערך ייחודי אחד לכל operator_id
+    seen_ids = {}
+    for d in data:
+        op_id = d.get("operator_ref")
+        name = d.get("agency_name")
+        if op_id is None:
+            continue
+        if op_id not in seen_ids:
+            seen_ids[op_id] = name
+    ops = [{"operator_id": op_id, "name": name} for op_id, name in seen_ids.items()]
     ops.sort(key=lambda o: o["name"] or "")
     return ops
 
 
-def list_routes(operator_id, line_number, weeks_back):
-    date_from = (datetime.now() - timedelta(weeks=weeks_back)).strftime("%Y-%m-%d")
+def list_routes(operator_id, line_number, days_back):
+    date_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     date_to = datetime.now().strftime("%Y-%m-%d")
     params = (
         ("operator_refs", str(operator_id)),
@@ -81,14 +90,21 @@ def list_routes(operator_id, line_number, weeks_back):
         ("limit", 200),
     )
     data = api_get("/gtfs_routes/list", params)
+
     routes = []
     for d in data:
+        # סינון בצד הלקוח: ה-API לפעמים מתעלם מפילטר line_ref ומחזיר גם קווים אחרים,
+        # אז מוודאים בעצמנו שהקו תואם למה שביקשנו (route_short_name הוא מספר הקו בפועל)
+        short_name = str(d.get("route_short_name", "")).strip()
+        line_ref = str(d.get("line_ref", "")).strip()
+        if short_name != str(line_number).strip() and line_ref != str(line_number).strip():
+            continue
         route_key = f'{d.get("line_ref")}-{d.get("route_mkt")}-#' if d.get("route_mkt") else d.get("route_short_name")
         routes.append({
             "route_key": route_key,
             "label": f'{d.get("route_short_name")} | {d.get("route_long_name")} ({d.get("date")})',
         })
-    # הסרת כפילויות
+    # הסרת כפילויות (אותו route_key יכול לחזור על כמה תאריכים)
     seen = set()
     uniq = []
     for r in routes:
@@ -192,14 +208,16 @@ else:
     operator_id = st.text_input("מזהה מפעיל (operator_id)", value="3")
 
 line_number = st.text_input("מספר קו", value="836")
-weeks_back = st.number_input("כמה שבועות אחורה", min_value=1, max_value=26, value=4)
+days_back = st.number_input("כמה ימים אחורה", min_value=1, max_value=180, value=28)
 
 route_key = None
 if st.button("🔍 טען מסלולים אפשריים לקו זה"):
     with st.spinner("טוען מסלולים..."):
         try:
-            routes = list_routes(operator_id, line_number, weeks_back)
+            routes = list_routes(operator_id, line_number, days_back)
             st.session_state["routes"] = routes
+            if not routes:
+                st.warning("לא נמצאו מסלולים תואמים לקו זה בטווח התאריכים שנבחר.")
         except Exception as e:
             st.error(f"שגיאה בטעינת מסלולים: {e}")
 
@@ -218,7 +236,7 @@ st.divider()
 
 if st.button("▶️ התחל איסוף", type="primary", disabled=not (operator_id and line_number and departure_times)):
     today = datetime.now().date()
-    start_date = today - timedelta(weeks=int(weeks_back))
+    start_date = today - timedelta(days=int(days_back))
     all_dates = [start_date + timedelta(days=i) for i in range((today - start_date).days)]
     tasks = [(d, t) for d in all_dates for t in departure_times]
 
@@ -263,4 +281,3 @@ if "collected_rows" in st.session_state:
     writer.writeheader()
     writer.writerows(rows)
     st.download_button("⬇️ הורד כקובץ CSV", data=csv_buf.getvalue().encode("utf-8"), file_name="bus_gps_data.csv", mime="text/csv")
-                
