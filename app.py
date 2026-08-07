@@ -79,7 +79,7 @@ def list_operators():
     return ops
 
 
-def list_routes(operator_id, line_number, days_back):
+def list_routes(operator_id, line_number, days_back, filter_by_line=True):
     date_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     date_to = datetime.now().strftime("%Y-%m-%d")
     params = (
@@ -93,16 +93,18 @@ def list_routes(operator_id, line_number, days_back):
 
     routes = []
     for d in data:
-        # סינון בצד הלקוח: ה-API לפעמים מתעלם מפילטר line_ref ומחזיר גם קווים אחרים,
-        # אז מוודאים בעצמנו שהקו תואם למה שביקשנו (route_short_name הוא מספר הקו בפועל)
         short_name = str(d.get("route_short_name", "")).strip()
         line_ref = str(d.get("line_ref", "")).strip()
-        if short_name != str(line_number).strip() and line_ref != str(line_number).strip():
-            continue
+        if filter_by_line:
+            # סינון בצד הלקוח: ה-API לפעמים מתעלם מפילטר line_ref ומחזיר גם קווים אחרים,
+            # אז מוודאים בעצמנו שהקו תואם למה שביקשנו
+            if short_name != str(line_number).strip() and line_ref != str(line_number).strip():
+                continue
         route_key = f'{d.get("line_ref")}-{d.get("route_mkt")}-#' if d.get("route_mkt") else d.get("route_short_name")
         routes.append({
             "route_key": route_key,
-            "label": f'{d.get("route_short_name")} | {d.get("route_long_name")} ({d.get("date")})',
+            "label": f'{short_name} (line_ref={line_ref}) | {d.get("route_long_name")} ({d.get("date")})',
+            "raw": d,
         })
     # הסרת כפילויות (אותו route_key יכול לחזור על כמה תאריכים)
     seen = set()
@@ -210,14 +212,18 @@ else:
 line_number = st.text_input("מספר קו", value="836")
 days_back = st.number_input("כמה ימים אחורה", min_value=1, max_value=180, value=28)
 
+debug_no_filter = st.checkbox("🐞 מצב דיבאג: הצג את כל התוצאות בלי סינון לפי מספר קו", value=False)
+
 route_key = None
 if st.button("🔍 טען מסלולים אפשריים לקו זה"):
     with st.spinner("טוען מסלולים..."):
         try:
-            routes = list_routes(operator_id, line_number, days_back)
+            routes = list_routes(operator_id, line_number, days_back, filter_by_line=not debug_no_filter)
             st.session_state["routes"] = routes
             if not routes:
-                st.warning("לא נמצאו מסלולים תואמים לקו זה בטווח התאריכים שנבחר.")
+                st.warning("לא נמצאו מסלולים כלל בטווח התאריכים שנבחר (גם בלי סינון). ייתכן שאין דאטה זמין לקו/למפעיל/לתאריכים האלה.")
+            elif debug_no_filter:
+                st.info(f"נמצאו {len(routes)} תוצאות ללא סינון - תוכל לבדוק אילו שדות (line_ref/route_short_name) חוזרים בפועל מה-API.")
         except Exception as e:
             st.error(f"שגיאה בטעינת מסלולים: {e}")
 
