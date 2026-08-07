@@ -1,0 +1,266 @@
+# -*- coding: utf-8 -*-
+"""
+Streamlit app - איסוף נתוני GPS היסטוריים של נסיעות אוטובוס
+מ-Open Bus Stride API. עובד מכל דפדפן, כולל טלפון.
+
+הרצה מקומית: streamlit run app.py
+פריסה אונליין: ראה הוראות בסוף הקובץ (בתגובה).
+"""
+
+import streamlit as st
+import requests
+import sqlite3
+import json
+import time
+import io
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+BASE_URL = "https://open-bus-stride-api.hasadna.org.il"
+REQUEST_TIMEOUT = 20
+RETRY_COUNT = 3
+
+st.set_page_config(page_title="איסוף GPS אוטובוסים", layout="centered")
+
+
+# ============================================================
+# HTTP helper
+# ============================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def api_get(path, params_tuple):
+    params = dict(params_tuple)
+    url = f"{BASE_URL}{path}"
+    last_err = None
+    for attempt in range(RETRY_COUNT):
+        try:
+            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(1.2 * (attempt + 1))
+    raise RuntimeError(f"נכשל GET {url} params={params}: {last_err}")
+
+
+def api_get_live(path, params):
+    """גרסה בלי cache, לשימוש בתוך threads בזמן איסוף בפועל."""
+    url = f"{BASE_URL}{path}"
+    last_err = None
+    for attempt in range(RETRY_COUNT):
+        try:
+            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(1.2 * (attempt + 1))
+    raise RuntimeError(f"נכשל GET {url} params={params}: {last_err}")
+
+
+# ============================================================
+# שליפת רשימות לבחירה
+# ============================================================
+
+def list_operators():
+    data = api_get("/gtfs_agencies/list", (("limit", 200),))
+    ops = [{"operator_id": d.get("operator_ref"), "name": d.get("agency_name")} for d in data]
+    ops = [o for o in ops if o["operator_id"] is not None]
+    ops.sort(key=lambda o: o["name"] or "")
+    return ops
+
+
+def list_routes(operator_id, line_number, weeks_back):
+    date_from = (datetime.now() - timedelta(weeks=weeks_back)).strftime("%Y-%m-%d")
+    date_to = datetime.now().strftime("%Y-%m-%d")
+    params = (
+        ("operator_refs", str(operator_id)),
+        ("line_ref", line_number),
+        ("date_from", date_from),
+        ("date_to", date_to),
+        ("limit", 200),
+    )
+    data = api_get("/gtfs_routes/list", params)
+    routes = []
+    for d in data:
+        route_key = f'{d.get("line_ref")}-{d.get("route_mkt")}-#' if d.get("route_mkt") else d.get("route_short_name")
+        routes.append({
+            "route_key": route_key,
+            "label": f'{d.get("route_short_name")} | {d.get("route_long_name")} ({d.get("date")})',
+        })
+    # הסרת כפילויות
+    seen = set()
+    uniq = []
+    for r in routes:
+        if r["route_key"] not in seen:
+            seen.add(r["route_key"])
+            uniq.append(r)
+    return uniq
+
+
+# ============================================================
+# איסוף
+# ============================================================
+
+def get_ride_for_date_time(operator_id, line_number, route_key, target_date, departure_time):
+    date_str = target_date.strftime("%Y-%m-%d")
+    params = {
+        "gtfs_route__route_short_name": line_number,
+        "gtfs_route__operator_refs": str(operator_id),
+        "scheduled_start_time_from": f"{date_str}T00:00:00",
+        "scheduled_start_time_to": f"{date_str}T23:59:59",
+        "order_by": "scheduled_start_time asc",
+        "limit": 200,
+    }
+    if route_key:
+        params["gtfs_route__route_key"] = route_key
+
+    rides = api_get_live("/siri_rides/list", params)
+    for r in rides:
+        sched = r.get("scheduled_start_time")
+        if sched and sched[11:16] == departure_time:
+            return {"siri_ride_id": r.get("id"), "scheduled_start_time": sched}
+    return None
+
+
+def get_gps_samples(siri_ride_id):
+    params = {"siri_ride_id": siri_ride_id, "order_by": "recorded_at_time asc", "limit": 5000}
+    data = api_get_live("/siri_vehicle_locations/list", params)
+    return [{"time": d.get("recorded_at_time"), "lat": d.get("lat"), "lon": d.get("lon")} for d in data]
+
+
+def collect_one(operator_id, line_number, route_key, target_date, departure_time):
+    date_str = target_date.strftime("%Y-%m-%d")
+    try:
+        ride = get_ride_for_date_time(operator_id, line_number, route_key, target_date, departure_time)
+        if ride is None:
+            return {"line": line_number, "date": date_str, "scheduled_time": departure_time,
+                     "status": "no_ride_found", "siri_ride_id": None, "gps_count": 0, "gps_samples": None}
+        samples = get_gps_samples(ride["siri_ride_id"])
+        return {"line": line_number, "date": date_str, "scheduled_time": departure_time,
+                 "status": "ok" if samples else "ride_found_no_gps",
+                 "siri_ride_id": ride["siri_ride_id"], "gps_count": len(samples),
+                 "gps_samples": json.dumps(samples, ensure_ascii=False)}
+    except Exception as e:
+        return {"line": line_number, "date": date_str, "scheduled_time": departure_time,
+                 "status": f"error: {e}", "siri_ride_id": None, "gps_count": 0, "gps_samples": None}
+
+
+def build_sqlite_bytes(rows):
+    buf = io.BytesIO()
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""
+        CREATE TABLE bus_rides (
+            line TEXT, date TEXT, scheduled_time TEXT, status TEXT,
+            siri_ride_id INTEGER, gps_count INTEGER, gps_samples TEXT,
+            PRIMARY KEY (line, date, scheduled_time)
+        )
+    """)
+    for row in rows:
+        conn.execute(
+            "INSERT OR REPLACE INTO bus_rides VALUES (?,?,?,?,?,?,?)",
+            (row["line"], row["date"], row["scheduled_time"], row["status"],
+             row["siri_ride_id"], row["gps_count"], row["gps_samples"]),
+        )
+    conn.commit()
+    for line in conn.iterdump():
+        buf.write((line + "\n").encode("utf-8"))
+    conn.close()
+    buf.seek(0)
+    return buf.read()
+
+
+# ============================================================
+# UI
+# ============================================================
+
+st.title("🚌 איסוף נתוני GPS היסטוריים")
+st.caption("Open Bus Stride API · הנדסה הפוכה של נתוני SIRI היסטוריים")
+
+with st.spinner("טוען רשימת מפעילים..."):
+    try:
+        operators = list_operators()
+    except Exception as e:
+        st.error(f"שגיאה בטעינת מפעילים: {e}")
+        operators = []
+
+if operators:
+    op_labels = [f'{o["name"]} ({o["operator_id"]})' for o in operators]
+    op_idx = st.selectbox("מפעיל", range(len(operators)), format_func=lambda i: op_labels[i])
+    operator_id = operators[op_idx]["operator_id"]
+else:
+    operator_id = st.text_input("מזהה מפעיל (operator_id)", value="3")
+
+line_number = st.text_input("מספר קו", value="836")
+weeks_back = st.number_input("כמה שבועות אחורה", min_value=1, max_value=26, value=4)
+
+route_key = None
+if st.button("🔍 טען מסלולים אפשריים לקו זה"):
+    with st.spinner("טוען מסלולים..."):
+        try:
+            routes = list_routes(operator_id, line_number, weeks_back)
+            st.session_state["routes"] = routes
+        except Exception as e:
+            st.error(f"שגיאה בטעינת מסלולים: {e}")
+
+if "routes" in st.session_state and st.session_state["routes"]:
+    routes = st.session_state["routes"]
+    r_idx = st.selectbox("מסלול (route_key)", range(len(routes)), format_func=lambda i: routes[i]["label"])
+    route_key = routes[r_idx]["route_key"]
+    st.caption(f"route_key שנבחר: `{route_key}`")
+
+departure_times_raw = st.text_input("שעות יציאה מתוכננות (מופרדות בפסיק)", value="16:30, 16:55")
+departure_times = [t.strip() for t in departure_times_raw.split(",") if t.strip()]
+
+max_workers = st.slider("מקביליות (מס' בקשות במקביל)", 1, 16, 8)
+
+st.divider()
+
+if st.button("▶️ התחל איסוף", type="primary", disabled=not (operator_id and line_number and departure_times)):
+    today = datetime.now().date()
+    start_date = today - timedelta(weeks=int(weeks_back))
+    all_dates = [start_date + timedelta(days=i) for i in range((today - start_date).days)]
+    tasks = [(d, t) for d in all_dates for t in departure_times]
+
+    st.write(f"סה״כ {len(tasks)} נסיעות לבדיקה ({len(all_dates)} ימים × {len(departure_times)} שעות יציאה)")
+
+    progress = st.progress(0)
+    status_area = st.empty()
+    rows = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(collect_one, operator_id, line_number, route_key, d, t): (d, t)
+            for d, t in tasks
+        }
+        done = 0
+        for future in as_completed(futures):
+            row = future.result()
+            rows.append(row)
+            done += 1
+            progress.progress(done / len(tasks))
+            status_area.text(f"[{done}/{len(tasks)}] {row['date']} {row['scheduled_time']} -> {row['status']} ({row['gps_count']} דגימות)")
+
+    st.success("האיסוף הסתיים!")
+    st.session_state["collected_rows"] = rows
+
+if "collected_rows" in st.session_state:
+    rows = st.session_state["collected_rows"]
+    ok_rows = [r for r in rows if r["status"] == "ok"]
+    st.metric("נסיעות עם GPS", f"{len(ok_rows)} / {len(rows)}")
+
+    st.dataframe(
+        [{"תאריך": r["date"], "שעה": r["scheduled_time"], "סטטוס": r["status"], "דגימות GPS": r["gps_count"]} for r in rows],
+        use_container_width=True,
+    )
+
+    sqlite_bytes = build_sqlite_bytes(rows)
+    st.download_button("⬇️ הורד כקובץ SQLite", data=sqlite_bytes, file_name="bus_gps_data.sql", mime="text/plain")
+
+    import csv
+    csv_buf = io.StringIO()
+    writer = csv.DictWriter(csv_buf, fieldnames=["line", "date", "scheduled_time", "status", "siri_ride_id", "gps_count", "gps_samples"])
+    writer.writeheader()
+    writer.writerows(rows)
+    st.download_button("⬇️ הורד כקובץ CSV", data=csv_buf.getvalue().encode("utf-8"), file_name="bus_gps_data.csv", mime="text/csv")
+                
