@@ -84,7 +84,7 @@ def list_routes(operator_id, line_number, days_back, filter_by_line=True):
     date_to = datetime.now().strftime("%Y-%m-%d")
     params = (
         ("operator_refs", str(operator_id)),
-        ("line_ref", line_number),
+        ("line_refs", str(line_number)),  # שם הפרמטר הנכון לפי תיעוד ה-API הוא ברבים
         ("date_from", date_from),
         ("date_to", date_to),
         ("limit", 200),
