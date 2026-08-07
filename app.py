@@ -100,10 +100,19 @@ def list_routes(operator_id, line_number, days_back, filter_by_line=True):
         if filter_by_line and short_name != str(line_number).strip():
             continue
         route_key = f'{d.get("line_ref")}-{d.get("route_mkt")}-#' if d.get("route_mkt") else d.get("route_short_name")
+
+        # route_long_name בדרך כלל בפורמט "מוצא<->יעד" - הופכים לתווית קריאה יותר
+        long_name = d.get("route_long_name") or ""
+        if "<->" in long_name:
+            origin, _, dest = long_name.partition("<->")
+            direction_label = f"{origin.strip()}  ⬅➡  {dest.strip()}"
+        else:
+            direction_label = long_name
+
         routes.append({
             "route_key": route_key,
             "line_ref": line_ref,
-            "label": f'{short_name} (line_ref={line_ref}) | {d.get("route_long_name")} ({d.get("date")})',
+            "label": f'קו {short_name} | {direction_label} | תוקף: {d.get("date")}',
             "raw": d,
         })
     # הסרת כפילויות (אותו route_key יכול לחזור על כמה תאריכים)
@@ -114,6 +123,24 @@ def list_routes(operator_id, line_number, days_back, filter_by_line=True):
             seen.add(r["route_key"])
             uniq.append(r)
     return uniq
+
+
+def list_departure_times(operator_id, line_number, route_key, sample_date):
+    """מביא את כל שעות היציאה המתוכננות בפועל (מה-SIRI) עבור מסלול נתון ביום דוגמה."""
+    date_str = sample_date.strftime("%Y-%m-%d")
+    params = {
+        "gtfs_route__route_short_name": line_number,
+        "gtfs_route__operator_refs": str(operator_id),
+        "scheduled_start_time_from": f"{date_str}T00:00:00",
+        "scheduled_start_time_to": f"{date_str}T23:59:59",
+        "order_by": "scheduled_start_time asc",
+        "limit": 500,
+    }
+    if route_key:
+        params["gtfs_route__route_key"] = route_key
+    rides = api_get_live("/siri_rides/list", params)
+    times = sorted({r.get("scheduled_start_time", "")[11:16] for r in rides if r.get("scheduled_start_time")})
+    return [t for t in times if t]
 
 
 # ============================================================
@@ -229,12 +256,40 @@ if st.button("🔍 טען מסלולים אפשריים לקו זה"):
 
 if "routes" in st.session_state and st.session_state["routes"]:
     routes = st.session_state["routes"]
-    r_idx = st.selectbox("מסלול (route_key)", range(len(routes)), format_func=lambda i: routes[i]["label"])
+    r_idx = st.selectbox("מסלול (כיוון)", range(len(routes)), format_func=lambda i: routes[i]["label"])
     route_key = routes[r_idx]["route_key"]
     st.caption(f"route_key שנבחר: `{route_key}`")
 
-departure_times_raw = st.text_input("שעות יציאה מתוכננות (מופרדות בפסיק)", value="16:30, 16:55")
-departure_times = [t.strip() for t in departure_times_raw.split(",") if t.strip()]
+    if st.button("🕐 טען שעות יציאה זמינות למסלול זה"):
+        with st.spinner("טוען שעות יציאה מהימים האחרונים..."):
+            try:
+                # בודקים על יום אתמול (בד"כ יש יותר דאטה סופי מאשר על היום הנוכחי)
+                sample_date = datetime.now().date() - timedelta(days=1)
+                times = list_departure_times(operator_id, line_number, route_key, sample_date)
+                if not times:
+                    # fallback ליום נוסף אם אתמול לא היה יום פעיל
+                    sample_date = datetime.now().date() - timedelta(days=2)
+                    times = list_departure_times(operator_id, line_number, route_key, sample_date)
+                st.session_state["available_times"] = times
+                if not times:
+                    st.warning("לא נמצאו שעות יציאה בימים האחרונים למסלול זה.")
+            except Exception as e:
+                st.error(f"שגיאה בטעינת שעות: {e}")
+
+departure_times = []
+if "available_times" in st.session_state and st.session_state["available_times"]:
+    st.write("בחר שעות יציאה מהרשימה (מבוסס על נתונים אמיתיים):")
+    cols = st.columns(4)
+    for i, t in enumerate(st.session_state["available_times"]):
+        with cols[i % 4]:
+            if st.checkbox(t, key=f"time_{t}", value=(t in ("16:30", "16:55"))):
+                departure_times.append(t)
+else:
+    st.caption("טען מסלול ואז שעות יציאה זמינות, או הזן ידנית למטה.")
+
+departure_times_manual = st.text_input("או: הזן שעות יציאה ידנית (מופרדות בפסיק)", value="")
+if departure_times_manual.strip():
+    departure_times = [t.strip() for t in departure_times_manual.split(",") if t.strip()]
 
 max_workers = st.slider("מקביליות (מס' בקשות במקביל)", 1, 16, 8)
 
