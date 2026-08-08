@@ -125,19 +125,22 @@ def list_routes(operator_id, line_number, days_back, filter_by_line=True):
     return uniq
 
 
-def list_departure_times(operator_id, line_number, route_key, sample_date):
-    """מביא את כל שעות היציאה המתוכננות בפועל (מה-SIRI) עבור מסלול נתון ביום דוגמה."""
+def list_departure_times(operator_id, line_number, line_ref, sample_date):
+    """מביא את כל שעות היציאה המתוכננות בפועל (מה-SIRI), מסונן לפי line_ref הפנימי
+    (הכיוון/מסלול הספציפי) ולא רק לפי מספר הקו הציבורי, כדי לא לערבב כיוונים.
+    """
     date_str = sample_date.strftime("%Y-%m-%d")
     params = {
-        "gtfs_route__route_short_name": line_number,
         "gtfs_route__operator_refs": str(operator_id),
         "scheduled_start_time_from": f"{date_str}T00:00:00",
         "scheduled_start_time_to": f"{date_str}T23:59:59",
         "order_by": "scheduled_start_time asc",
         "limit": 500,
     }
-    if route_key:
-        params["gtfs_route__route_key"] = route_key
+    if line_ref:
+        params["gtfs_route__line_refs"] = str(line_ref)
+    else:
+        params["gtfs_route__route_short_name"] = line_number
     rides = api_get_live("/siri_rides/list", params)
     times = sorted({r.get("scheduled_start_time", "")[11:16] for r in rides if r.get("scheduled_start_time")})
     return [t for t in times if t]
@@ -147,18 +150,21 @@ def list_departure_times(operator_id, line_number, route_key, sample_date):
 # איסוף
 # ============================================================
 
-def get_ride_for_date_time(operator_id, line_number, route_key, target_date, departure_time):
+def get_ride_for_date_time(operator_id, line_number, line_ref, target_date, departure_time):
     date_str = target_date.strftime("%Y-%m-%d")
     params = {
-        "gtfs_route__route_short_name": line_number,
         "gtfs_route__operator_refs": str(operator_id),
         "scheduled_start_time_from": f"{date_str}T00:00:00",
         "scheduled_start_time_to": f"{date_str}T23:59:59",
         "order_by": "scheduled_start_time asc",
         "limit": 200,
     }
-    if route_key:
-        params["gtfs_route__route_key"] = route_key
+    if line_ref:
+        # מסננים לפי line_ref הפנימי (לא route_key - שדה לא נתמך שגורם ל-500),
+        # כדי להבטיח שמדובר בכיוון/מסלול הנכון ולא רק במספר קו זהה שמכיל כמה כיוונים
+        params["gtfs_route__line_refs"] = str(line_ref)
+    else:
+        params["gtfs_route__route_short_name"] = line_number
 
     rides = api_get_live("/siri_rides/list", params)
     for r in rides:
@@ -174,10 +180,10 @@ def get_gps_samples(siri_ride_id):
     return [{"time": d.get("recorded_at_time"), "lat": d.get("lat"), "lon": d.get("lon")} for d in data]
 
 
-def collect_one(operator_id, line_number, route_key, target_date, departure_time):
+def collect_one(operator_id, line_number, line_ref, target_date, departure_time):
     date_str = target_date.strftime("%Y-%m-%d")
     try:
-        ride = get_ride_for_date_time(operator_id, line_number, route_key, target_date, departure_time)
+        ride = get_ride_for_date_time(operator_id, line_number, line_ref, target_date, departure_time)
         if ride is None:
             return {"line": line_number, "date": date_str, "scheduled_time": departure_time,
                      "status": "no_ride_found", "siri_ride_id": None, "gps_count": 0, "gps_samples": None}
@@ -258,23 +264,26 @@ if "routes" in st.session_state and st.session_state["routes"]:
     routes = st.session_state["routes"]
     r_idx = st.selectbox("מסלול (כיוון)", range(len(routes)), format_func=lambda i: routes[i]["label"])
     route_key = routes[r_idx]["route_key"]
-    st.caption(f"route_key שנבחר: `{route_key}`")
+    line_ref = routes[r_idx]["line_ref"]
+    st.caption(f"route_key: `{route_key}` · line_ref (משמש לסינון בפועל): `{line_ref}`")
 
     if st.button("🕐 טען שעות יציאה זמינות למסלול זה"):
         with st.spinner("טוען שעות יציאה מהימים האחרונים..."):
             try:
                 # בודקים על יום אתמול (בד"כ יש יותר דאטה סופי מאשר על היום הנוכחי)
                 sample_date = datetime.now().date() - timedelta(days=1)
-                times = list_departure_times(operator_id, line_number, route_key, sample_date)
+                times = list_departure_times(operator_id, line_number, line_ref, sample_date)
                 if not times:
                     # fallback ליום נוסף אם אתמול לא היה יום פעיל
                     sample_date = datetime.now().date() - timedelta(days=2)
-                    times = list_departure_times(operator_id, line_number, route_key, sample_date)
+                    times = list_departure_times(operator_id, line_number, line_ref, sample_date)
                 st.session_state["available_times"] = times
                 if not times:
                     st.warning("לא נמצאו שעות יציאה בימים האחרונים למסלול זה.")
             except Exception as e:
                 st.error(f"שגיאה בטעינת שעות: {e}")
+else:
+    line_ref = None
 
 departure_times = []
 if "available_times" in st.session_state and st.session_state["available_times"]:
@@ -309,7 +318,7 @@ if st.button("▶️ התחל איסוף", type="primary", disabled=not (operato
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(collect_one, operator_id, line_number, route_key, d, t): (d, t)
+            executor.submit(collect_one, operator_id, line_number, line_ref, d, t): (d, t)
             for d, t in tasks
         }
         done = 0
