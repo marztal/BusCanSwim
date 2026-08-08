@@ -125,25 +125,38 @@ def list_routes(operator_id, line_number, days_back, filter_by_line=True):
     return uniq
 
 
-def list_departure_times(operator_id, line_number, line_ref, sample_date):
-    """מביא את כל שעות היציאה המתוכננות בפועל (מה-SIRI), מסונן לפי line_ref הפנימי
-    (הכיוון/מסלול הספציפי) ולא רק לפי מספר הקו הציבורי, כדי לא לערבב כיוונים.
+def _query_siri_rides(operator_id, line_number, line_ref, date_str, limit):
+    """שולף נסיעות SIRI ליום נתון, עם ניסיון סינון לפי line_ref ונפילה חזרה
+    (fallback) לסינון לפי route_short_name אם השרת מחזיר שגיאה (500) על שם
+    השדה - כדי לא לתקוע את המשתמש כשמנחשים שם פרמטר לא נכון.
     """
-    date_str = sample_date.strftime("%Y-%m-%d")
-    params = {
+    base_params = {
         "gtfs_route__operator_refs": str(operator_id),
         "scheduled_start_time_from": f"{date_str}T00:00:00",
         "scheduled_start_time_to": f"{date_str}T23:59:59",
         "order_by": "scheduled_start_time asc",
-        "limit": 500,
+        "limit": limit,
     }
     if line_ref:
-        params["gtfs_route__line_refs"] = str(line_ref)
-    else:
-        params["gtfs_route__route_short_name"] = line_number
-    rides = api_get_live("/siri_rides/list", params)
+        try:
+            params = dict(base_params)
+            params["siri_route__line_refs"] = str(line_ref)
+            return api_get_live("/siri_rides/list", params), True
+        except Exception:
+            pass  # נופלים חזרה לסינון הכללי יותר
+    params = dict(base_params)
+    params["gtfs_route__route_short_name"] = line_number
+    return api_get_live("/siri_rides/list", params), False
+
+
+def list_departure_times(operator_id, line_number, line_ref, sample_date):
+    """מביא את כל שעות היציאה המתוכננות בפועל (מה-SIRI), מנסה לסנן לפי line_ref
+    הפנימי ונופל חזרה לסינון לפי מספר קו אם זה לא נתמך.
+    """
+    date_str = sample_date.strftime("%Y-%m-%d")
+    rides, filtered_by_line_ref = _query_siri_rides(operator_id, line_number, line_ref, date_str, 500)
     times = sorted({r.get("scheduled_start_time", "")[11:16] for r in rides if r.get("scheduled_start_time")})
-    return [t for t in times if t]
+    return [t for t in times if t], filtered_by_line_ref
 
 
 # ============================================================
@@ -152,21 +165,7 @@ def list_departure_times(operator_id, line_number, line_ref, sample_date):
 
 def get_ride_for_date_time(operator_id, line_number, line_ref, target_date, departure_time):
     date_str = target_date.strftime("%Y-%m-%d")
-    params = {
-        "gtfs_route__operator_refs": str(operator_id),
-        "scheduled_start_time_from": f"{date_str}T00:00:00",
-        "scheduled_start_time_to": f"{date_str}T23:59:59",
-        "order_by": "scheduled_start_time asc",
-        "limit": 200,
-    }
-    if line_ref:
-        # מסננים לפי line_ref הפנימי (לא route_key - שדה לא נתמך שגורם ל-500),
-        # כדי להבטיח שמדובר בכיוון/מסלול הנכון ולא רק במספר קו זהה שמכיל כמה כיוונים
-        params["gtfs_route__line_refs"] = str(line_ref)
-    else:
-        params["gtfs_route__route_short_name"] = line_number
-
-    rides = api_get_live("/siri_rides/list", params)
+    rides, _ = _query_siri_rides(operator_id, line_number, line_ref, date_str, 200)
     for r in rides:
         sched = r.get("scheduled_start_time")
         if sched and sched[11:16] == departure_time:
@@ -272,12 +271,14 @@ if "routes" in st.session_state and st.session_state["routes"]:
             try:
                 # בודקים על יום אתמול (בד"כ יש יותר דאטה סופי מאשר על היום הנוכחי)
                 sample_date = datetime.now().date() - timedelta(days=1)
-                times = list_departure_times(operator_id, line_number, line_ref, sample_date)
+                times, filtered_by_line_ref = list_departure_times(operator_id, line_number, line_ref, sample_date)
                 if not times:
                     # fallback ליום נוסף אם אתמול לא היה יום פעיל
                     sample_date = datetime.now().date() - timedelta(days=2)
-                    times = list_departure_times(operator_id, line_number, line_ref, sample_date)
+                    times, filtered_by_line_ref = list_departure_times(operator_id, line_number, line_ref, sample_date)
                 st.session_state["available_times"] = times
+                if not filtered_by_line_ref:
+                    st.info("⚠️ הסינון לפי line_ref לא נתמך ע\"י ה-API - הרשימה כאן היא לכל הכיוונים של הקו יחד, ייתכן שיש כפילויות/שעות משני הכיוונים.")
                 if not times:
                     st.warning("לא נמצאו שעות יציאה בימים האחרונים למסלול זה.")
             except Exception as e:
