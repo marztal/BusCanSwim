@@ -125,10 +125,11 @@ def list_routes(operator_id, line_number, days_back, filter_by_line=True):
     return uniq
 
 
-def _query_siri_rides(operator_id, line_number, line_ref, date_str, limit):
-    """שולף נסיעות SIRI ליום נתון, עם ניסיון סינון לפי line_ref ונפילה חזרה
-    (fallback) לסינון לפי route_short_name אם השרת מחזיר שגיאה (500) על שם
-    השדה - כדי לא לתקוע את המשתמש כשמנחשים שם פרמטר לא נכון.
+def _query_siri_rides(operator_id, line_number, line_ref, date_str, limit, minimal=False):
+    """שולף נסיעות SIRI ליום נתון.
+    minimal=True: שאילתה מינימלית לצורך אבחון - רק operator_refs+תאריך, בלי שום
+    סינון לפי קו בכלל. שימושי כדי לבודד אם ה-500 נגרם מסינון הקו או ממשהו אחר.
+    אחרת: מנסה סינון לפי line_ref, ונופל חזרה ל-route_short_name אם נכשל.
     """
     base_params = {
         "gtfs_route__operator_refs": str(operator_id),
@@ -137,26 +138,29 @@ def _query_siri_rides(operator_id, line_number, line_ref, date_str, limit):
         "order_by": "scheduled_start_time asc",
         "limit": limit,
     }
+    if minimal:
+        return api_get_live("/siri_rides/list", base_params), "minimal"
+
     if line_ref:
         try:
             params = dict(base_params)
             params["siri_route__line_refs"] = str(line_ref)
-            return api_get_live("/siri_rides/list", params), True
+            return api_get_live("/siri_rides/list", params), "line_ref"
         except Exception:
             pass  # נופלים חזרה לסינון הכללי יותר
     params = dict(base_params)
     params["gtfs_route__route_short_name"] = line_number
-    return api_get_live("/siri_rides/list", params), False
+    return api_get_live("/siri_rides/list", params), "route_short_name"
 
 
-def list_departure_times(operator_id, line_number, line_ref, sample_date):
+def list_departure_times(operator_id, line_number, line_ref, sample_date, minimal=False):
     """מביא את כל שעות היציאה המתוכננות בפועל (מה-SIRI), מנסה לסנן לפי line_ref
     הפנימי ונופל חזרה לסינון לפי מספר קו אם זה לא נתמך.
     """
     date_str = sample_date.strftime("%Y-%m-%d")
-    rides, filtered_by_line_ref = _query_siri_rides(operator_id, line_number, line_ref, date_str, 500)
+    rides, used_filter = _query_siri_rides(operator_id, line_number, line_ref, date_str, 500, minimal=minimal)
     times = sorted({r.get("scheduled_start_time", "")[11:16] for r in rides if r.get("scheduled_start_time")})
-    return [t for t in times if t], filtered_by_line_ref
+    return [t for t in times if t], used_filter, len(rides)
 
 
 # ============================================================
@@ -245,6 +249,7 @@ line_number = st.text_input("מספר קו", value="836")
 days_back = st.number_input("כמה ימים אחורה", min_value=1, max_value=180, value=28)
 
 debug_no_filter = st.checkbox("🐞 מצב דיבאג: הצג את כל התוצאות בלי סינון לפי מספר קו", value=False)
+debug_minimal_query = st.checkbox("🧪 בדיקת אבחון: שאילתה מינימלית (רק operator+תאריך, בלי שום סינון קו)", value=False)
 
 route_key = None
 if st.button("🔍 טען מסלולים אפשריים לקו זה"):
@@ -269,16 +274,21 @@ if "routes" in st.session_state and st.session_state["routes"]:
     if st.button("🕐 טען שעות יציאה זמינות למסלול זה"):
         with st.spinner("טוען שעות יציאה מהימים האחרונים..."):
             try:
-                # בודקים על יום אתמול (בד"כ יש יותר דאטה סופי מאשר על היום הנוכחי)
                 sample_date = datetime.now().date() - timedelta(days=1)
-                times, filtered_by_line_ref = list_departure_times(operator_id, line_number, line_ref, sample_date)
+                times, used_filter, n_rides = list_departure_times(
+                    operator_id, line_number, line_ref, sample_date, minimal=debug_minimal_query
+                )
                 if not times:
-                    # fallback ליום נוסף אם אתמול לא היה יום פעיל
                     sample_date = datetime.now().date() - timedelta(days=2)
-                    times, filtered_by_line_ref = list_departure_times(operator_id, line_number, line_ref, sample_date)
+                    times, used_filter, n_rides = list_departure_times(
+                        operator_id, line_number, line_ref, sample_date, minimal=debug_minimal_query
+                    )
                 st.session_state["available_times"] = times
-                if not filtered_by_line_ref:
-                    st.info("⚠️ הסינון לפי line_ref לא נתמך ע\"י ה-API - הרשימה כאן היא לכל הכיוונים של הקו יחד, ייתכן שיש כפילויות/שעות משני הכיוונים.")
+                st.caption(f"סוג סינון שהצליח: `{used_filter}` · {n_rides} נסיעות חזרו מה-API בתאריך {sample_date}")
+                if used_filter == "route_short_name":
+                    st.info("⚠️ הסינון לפי line_ref לא נתמך/נכשל - הרשימה היא לכל הכיוונים של הקו יחד.")
+                elif used_filter == "minimal":
+                    st.info("זו שאילתת אבחון בלי סינון קו כלל - כל הנסיעות של המפעיל ביום הזה.")
                 if not times:
                     st.warning("לא נמצאו שעות יציאה בימים האחרונים למסלול זה.")
             except Exception as e:
