@@ -3,8 +3,14 @@
 Streamlit app - איסוף נתוני GPS היסטוריים של נסיעות אוטובוס
 מ-Open Bus Stride API. עובד מכל דפדפן, כולל טלפון.
 
+בנוי לפי הזרימה המוכחת שעבדה בעבר עבור קו 826 (route826.py):
+  1. gtfs_routes/list (route_short_name)          -> gtfs_route_id לכל תאריך+כיוון
+  2. gtfs_rides/list (gtfs_route_id)               -> לוח זמנים מתוכנן (start_time)
+  3. siri_routes/list (line_refs)                  -> siri_route_id לפי הכיוון
+  4. siri_ride_stops/list (siri_route__line_ref)   -> siri_ride_id + vehicle_ref
+  5. siri_vehicle_locations/list (siri_rides__ids) -> כל דגימות ה-GPS
+
 הרצה מקומית: streamlit run app.py
-פריסה אונליין: ראה הוראות בסוף הקובץ (בתגובה).
 """
 
 import streamlit as st
@@ -13,12 +19,15 @@ import sqlite3
 import json
 import time
 import io
+import csv
+from urllib.parse import urlencode, quote
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE_URL = "https://open-bus-stride-api.hasadna.org.il"
-REQUEST_TIMEOUT = 20
-RETRY_COUNT = 3
+REQUEST_TIMEOUT = 45
+RETRY_COUNT = 4
+IL_OFFSET = timedelta(hours=3)  # קירוב לשעון ישראל (לא מטפל ב-DST בצורה מדויקת)
 
 st.set_page_config(page_title="איסוף GPS אוטובוסים", layout="centered")
 
@@ -27,45 +36,47 @@ st.set_page_config(page_title="איסוף GPS אוטובוסים", layout="cente
 # HTTP helper
 # ============================================================
 
+def fetch(endpoint, params, timeout=REQUEST_TIMEOUT):
+    """קריאת GET גנרית, עם retry על 500 (בדיוק כמו בסקריפט המקורי שעבד)."""
+    q = urlencode(params, quote_via=quote)
+    url = f"{BASE_URL}/{endpoint}?{q}"
+    last_err = None
+    for attempt in range(RETRY_COUNT):
+        try:
+            r = requests.get(url, timeout=timeout)
+            if r.status_code == 500:
+                last_err = f"500 Server Error (ניסיון {attempt+1})"
+                time.sleep(2 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except requests.exceptions.Timeout:
+            last_err = "timeout"
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"נכשל GET {endpoint} params={params}: {last_err}")
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def api_get(path, params_tuple):
-    params = dict(params_tuple)
-    url = f"{BASE_URL}{path}"
-    last_err = None
-    for attempt in range(RETRY_COUNT):
-        try:
-            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            last_err = e
-            time.sleep(1.2 * (attempt + 1))
-    raise RuntimeError(f"נכשל GET {url} params={params}: {last_err}")
+def fetch_cached(endpoint, params_tuple):
+    return fetch(endpoint, dict(params_tuple))
 
 
-def api_get_live(path, params):
-    """גרסה בלי cache, לשימוש בתוך threads בזמן איסוף בפועל."""
-    url = f"{BASE_URL}{path}"
-    last_err = None
-    for attempt in range(RETRY_COUNT):
-        try:
-            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            last_err = e
-            time.sleep(1.2 * (attempt + 1))
-    raise RuntimeError(f"נכשל GET {url} params={params}: {last_err}")
+def il_hm(utc_str):
+    if not utc_str:
+        return ""
+    dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+    return (dt + IL_OFFSET).strftime("%H:%M")
 
 
 # ============================================================
-# שליפת רשימות לבחירה
+# שלב 1: מפעילים
 # ============================================================
 
 def list_operators():
-    data = api_get("/gtfs_agencies/list", (("limit", 200),))
-    # יש רשומות היסטוריות כפולות לאותו operator_ref (למשל "אגד" מופיע כמה פעמים
-    # עם תאריכי תוקף שונים) - שומרים רק ערך ייחודי אחד לכל operator_id
+    data = fetch_cached("gtfs_agencies/list", (("limit", 200),))
     seen_ids = {}
     for d in data:
         op_id = d.get("operator_ref")
@@ -79,133 +90,166 @@ def list_operators():
     return ops
 
 
-def list_routes(operator_id, line_number, days_back, filter_by_line=True):
+# ============================================================
+# שלב 2: מסלולים (כיוונים) לקו נתון
+# ============================================================
+
+def list_routes(operator_id, line_number, days_back):
+    """מביא את כל רשומות ה-gtfs_route של הקו הזה (route_short_name ישיר, בלי
+    prefix - זה עובד ישירות על טבלת gtfs_route, לא דרך join), ומקבץ לפי כיוון
+    (line_ref+route_direction) כדי להציג רשימת "מסלולים" ברורה לבחירה.
+    """
     date_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     date_to = datetime.now().strftime("%Y-%m-%d")
-    # לא שולחים line_refs ל-API: זהו מזהה פנימי בבסיס הנתונים ולא מספר הקו הציבורי
-    # (route_short_name). מספר קו אחד (למשל 826) יכול להופיע עם כמה line_ref שונים.
-    # לכן שולפים לפי מפעיל+תאריכים בלבד, ומסננים בעצמנו לפי route_short_name.
-    params = (
-        ("operator_refs", str(operator_id)),
-        ("date_from", date_from),
-        ("date_to", date_to),
-        ("limit", 1000),
-    )
-    data = api_get("/gtfs_routes/list", params)
+    rows = fetch("gtfs_routes/list", {
+        "route_short_name": str(line_number),
+        "operator_refs": str(operator_id),
+        "date_from": date_from,
+        "date_to": date_to,
+        "order_by": "date desc",
+        "limit": 1000,
+    })
+
+    # מקבצים לפי כיוון (line_ref + route_direction) - זו "הזהות" האמיתית של
+    # המסלול; לכל כיוון שומרים את הרשומה העדכנית ביותר לתצוגה
+    by_direction = {}
+    for d in rows:
+        key = (d.get("line_ref"), d.get("route_direction"))
+        if key not in by_direction or d.get("date", "") > by_direction[key]["date"]:
+            by_direction[key] = d
 
     routes = []
-    for d in data:
-        short_name = str(d.get("route_short_name", "")).strip()
-        line_ref = str(d.get("line_ref", "")).strip()
-        if filter_by_line and short_name != str(line_number).strip():
-            continue
-        route_key = f'{d.get("line_ref")}-{d.get("route_mkt")}-#' if d.get("route_mkt") else d.get("route_short_name")
-
-        # route_long_name בדרך כלל בפורמט "מוצא<->יעד" - הופכים לתווית קריאה יותר
+    for (line_ref, direction), d in by_direction.items():
         long_name = d.get("route_long_name") or ""
         if "<->" in long_name:
             origin, _, dest = long_name.partition("<->")
             direction_label = f"{origin.strip()}  ⬅➡  {dest.strip()}"
         else:
             direction_label = long_name
-
         routes.append({
-            "route_key": route_key,
             "line_ref": line_ref,
-            "label": f'קו {short_name} | {direction_label} | תוקף: {d.get("date")}',
-            "raw": d,
+            "route_direction": direction,
+            "label": f'קו {d.get("route_short_name")} | {direction_label} | כיוון: {direction} | עדכני ל: {d.get("date")}',
         })
-    # הסרת כפילויות (אותו route_key יכול לחזור על כמה תאריכים)
-    seen = set()
-    uniq = []
-    for r in routes:
-        if r["route_key"] not in seen:
-            seen.add(r["route_key"])
-            uniq.append(r)
-    return uniq
-
-
-def _query_siri_rides(operator_id, line_number, line_ref, date_str, limit, minimal=False, bare=False):
-    """שולף נסיעות SIRI ליום נתון.
-    bare=True: אבחון עומק - בלי order_by ובלי limit בכלל, רק תאריך+מפעיל.
-    minimal=True: רק operator_refs+תאריך+order_by+limit, בלי סינון קו.
-    אחרת: מנסה סינון לפי line_ref, ונופל חזרה ל-route_short_name אם נכשל.
-    """
-    if bare:
-        params = {
-            "gtfs_route__operator_refs": str(operator_id),
-            "scheduled_start_time_from": f"{date_str}T00:00:00",
-            "scheduled_start_time_to": f"{date_str}T23:59:59",
-        }
-        return api_get_live("/siri_rides/list", params), "bare"
-
-    base_params = {
-        "gtfs_route__operator_refs": str(operator_id),
-        "scheduled_start_time_from": f"{date_str}T00:00:00",
-        "scheduled_start_time_to": f"{date_str}T23:59:59",
-        "order_by": "scheduled_start_time asc",
-        "limit": limit,
-    }
-    if minimal:
-        return api_get_live("/siri_rides/list", base_params), "minimal"
-
-    if line_ref:
-        try:
-            params = dict(base_params)
-            params["siri_route__line_refs"] = str(line_ref)
-            return api_get_live("/siri_rides/list", params), "line_ref"
-        except Exception:
-            pass  # נופלים חזרה לסינון הכללי יותר
-    params = dict(base_params)
-    params["gtfs_route__route_short_name"] = line_number
-    return api_get_live("/siri_rides/list", params), "route_short_name"
-
-
-def list_departure_times(operator_id, line_number, line_ref, sample_date, minimal=False, bare=False):
-    """מביא את כל שעות היציאה המתוכננות בפועל (מה-SIRI), מנסה לסנן לפי line_ref
-    הפנימי ונופל חזרה לסינון לפי מספר קו אם זה לא נתמך.
-    """
-    date_str = sample_date.strftime("%Y-%m-%d")
-    rides, used_filter = _query_siri_rides(operator_id, line_number, line_ref, date_str, 500, minimal=minimal, bare=bare)
-    times = sorted({r.get("scheduled_start_time", "")[11:16] for r in rides if r.get("scheduled_start_time")})
-    return [t for t in times if t], used_filter, len(rides)
+    routes.sort(key=lambda r: str(r["route_direction"]))
+    return routes
 
 
 # ============================================================
-# איסוף
+# שלב 3: gtfs_route_id ליום ספציפי + כיוון נתון
 # ============================================================
 
-def get_ride_for_date_time(operator_id, line_number, line_ref, target_date, departure_time):
-    date_str = target_date.strftime("%Y-%m-%d")
-    rides, _ = _query_siri_rides(operator_id, line_number, line_ref, date_str, 200)
-    for r in rides:
-        sched = r.get("scheduled_start_time")
-        if sched and sched[11:16] == departure_time:
-            return {"siri_ride_id": r.get("id"), "scheduled_start_time": sched}
+def get_gtfs_route_id_for_date(operator_id, line_number, line_ref, route_direction, date_str):
+    """שולף gtfs_route_id התואם בדיוק לתאריך ולכיוון הנתונים."""
+    rows = fetch("gtfs_routes/list", {
+        "route_short_name": str(line_number),
+        "operator_refs": str(operator_id),
+        "date_from": date_str,
+        "date_to": date_str,
+        "limit": 200,
+    })
+    for r in rows:
+        if r.get("line_ref") == line_ref and r.get("route_direction") == route_direction and r.get("date") == date_str:
+            return r.get("id")
     return None
 
 
+# ============================================================
+# שלב 4: לוח זמנים מתוכנן (gtfs_rides) ליום נתון
+# ============================================================
+
+def get_gtfs_rides(gtfs_route_id):
+    return fetch("gtfs_rides/list", {"gtfs_route_id": gtfs_route_id, "limit": 100})
+
+
+# ============================================================
+# שלב 5: siri_route_id לפי line_ref
+# ============================================================
+
+def get_siri_route_ids(line_ref):
+    rows = fetch("siri_routes/list", {"line_refs": line_ref, "limit": 10})
+    return [r["id"] for r in rows]
+
+
+# ============================================================
+# שלב 6: siri_ride_stops - התאמת siri_ride_id + vehicle_ref לפי scheduled_start_time
+# ============================================================
+
+def get_siri_data(line_ref, date_str):
+    time_from = f"{date_str}T01:00:00+00:00"
+    time_to = f"{date_str}T23:59:00+00:00"
+    result = {}
+    rows = fetch("siri_ride_stops/list", {
+        "siri_route__line_ref": line_ref,
+        "siri_ride__scheduled_start_time_from": time_from,
+        "siri_ride__scheduled_start_time_to": time_to,
+        "limit": 100,
+    })
+    for row in rows:
+        key = row.get("siri_ride__scheduled_start_time", "")
+        if key and key not in result:
+            result[key] = row
+    return result
+
+
+# ============================================================
+# שלב 7: GPS מלא לנסיעה ספציפית
+# ============================================================
+
 def get_gps_samples(siri_ride_id):
-    params = {"siri_ride_id": siri_ride_id, "order_by": "recorded_at_time asc", "limit": 5000}
-    data = api_get_live("/siri_vehicle_locations/list", params)
-    return [{"time": d.get("recorded_at_time"), "lat": d.get("lat"), "lon": d.get("lon")} for d in data]
+    rows = fetch("siri_vehicle_locations/list", {"siri_rides__ids": siri_ride_id, "limit": 5000})
+    rows = sorted(rows, key=lambda r: r.get("recorded_at_time") or "")
+    return [{"time": r.get("recorded_at_time"), "lat": r.get("lat"), "lon": r.get("lon")} for r in rows]
 
 
-def collect_one(operator_id, line_number, line_ref, target_date, departure_time):
+# ============================================================
+# איסוף עבור יום+שעת יציאה בודדים
+# ============================================================
+
+def collect_one(operator_id, line_number, line_ref, route_direction, target_date, departure_time):
     date_str = target_date.strftime("%Y-%m-%d")
     try:
-        ride = get_ride_for_date_time(operator_id, line_number, line_ref, target_date, departure_time)
-        if ride is None:
+        gtfs_route_id = get_gtfs_route_id_for_date(operator_id, line_number, line_ref, route_direction, date_str)
+        if gtfs_route_id is None:
             return {"line": line_number, "date": date_str, "scheduled_time": departure_time,
-                     "status": "no_ride_found", "siri_ride_id": None, "gps_count": 0, "gps_samples": None}
-        samples = get_gps_samples(ride["siri_ride_id"])
+                     "status": "no_gtfs_route_for_date", "siri_ride_id": None, "gps_count": 0, "gps_samples": None}
+
+        rides = get_gtfs_rides(gtfs_route_id)
+        matching_ride = None
+        for ride in rides:
+            if il_hm(ride.get("start_time")) == departure_time:
+                matching_ride = ride
+                break
+        if matching_ride is None:
+            return {"line": line_number, "date": date_str, "scheduled_time": departure_time,
+                     "status": "no_ride_at_this_time", "siri_ride_id": None, "gps_count": 0, "gps_samples": None}
+
+        siri_data = get_siri_data(line_ref, date_str)
+        siri_row = siri_data.get(matching_ride.get("start_time"), {})
+        siri_ride_id = siri_row.get("siri_ride_id") or siri_row.get("siri_ride__id")
+        if not siri_ride_id:
+            return {"line": line_number, "date": date_str, "scheduled_time": departure_time,
+                     "status": "no_siri_match", "siri_ride_id": None, "gps_count": 0, "gps_samples": None}
+
+        samples = get_gps_samples(siri_ride_id)
         return {"line": line_number, "date": date_str, "scheduled_time": departure_time,
                  "status": "ok" if samples else "ride_found_no_gps",
-                 "siri_ride_id": ride["siri_ride_id"], "gps_count": len(samples),
+                 "siri_ride_id": siri_ride_id, "gps_count": len(samples),
                  "gps_samples": json.dumps(samples, ensure_ascii=False)}
     except Exception as e:
         return {"line": line_number, "date": date_str, "scheduled_time": departure_time,
                  "status": f"error: {e}", "siri_ride_id": None, "gps_count": 0, "gps_samples": None}
+
+
+def list_departure_times(operator_id, line_number, line_ref, route_direction, sample_date):
+    """שעות יציאה מתוכננות אמיתיות ליום דוגמה, ישירות מ-gtfs_rides."""
+    date_str = sample_date.strftime("%Y-%m-%d")
+    gtfs_route_id = get_gtfs_route_id_for_date(operator_id, line_number, line_ref, route_direction, date_str)
+    if gtfs_route_id is None:
+        return [], gtfs_route_id
+    rides = get_gtfs_rides(gtfs_route_id)
+    times = sorted({il_hm(r.get("start_time")) for r in rides if r.get("start_time")})
+    return [t for t in times if t], gtfs_route_id
 
 
 def build_sqlite_bytes(rows):
@@ -237,7 +281,7 @@ def build_sqlite_bytes(rows):
 # ============================================================
 
 st.title("🚌 איסוף נתוני GPS היסטוריים")
-st.caption("Open Bus Stride API · הנדסה הפוכה של נתוני SIRI היסטוריים")
+st.caption("Open Bus Stride API · בנוי לפי הזרימה המוכחת מפרויקט קו 826")
 
 with st.spinner("טוען רשימת מפעילים..."):
     try:
@@ -256,56 +300,44 @@ else:
 line_number = st.text_input("מספר קו", value="836")
 days_back = st.number_input("כמה ימים אחורה", min_value=1, max_value=180, value=28)
 
-debug_no_filter = st.checkbox("🐞 מצב דיבאג: הצג את כל התוצאות בלי סינון לפי מספר קו", value=False)
-debug_minimal_query = st.checkbox("🧪 בדיקת אבחון: שאילתה מינימלית (רק operator+תאריך, בלי שום סינון קו)", value=False)
-debug_bare_query = st.checkbox("🧪🧪 בדיקת אבחון עמוקה: בלי order_by ובלי limit בכלל", value=False)
-
-route_key = None
-if st.button("🔍 טען מסלולים אפשריים לקו זה"):
+line_ref = None
+route_direction = None
+if st.button("🔍 טען מסלולים (כיוונים) אפשריים לקו זה"):
     with st.spinner("טוען מסלולים..."):
         try:
-            routes = list_routes(operator_id, line_number, days_back, filter_by_line=not debug_no_filter)
+            routes = list_routes(operator_id, line_number, days_back)
             st.session_state["routes"] = routes
             if not routes:
-                st.warning("לא נמצאו מסלולים כלל בטווח התאריכים שנבחר (גם בלי סינון). ייתכן שאין דאטה זמין לקו/למפעיל/לתאריכים האלה.")
-            elif debug_no_filter:
-                st.info(f"נמצאו {len(routes)} תוצאות ללא סינון - תוכל לבדוק אילו שדות (line_ref/route_short_name) חוזרים בפועל מה-API.")
+                st.warning("לא נמצאו מסלולים לקו/למפעיל/לתאריכים האלה.")
         except Exception as e:
             st.error(f"שגיאה בטעינת מסלולים: {e}")
 
 if "routes" in st.session_state and st.session_state["routes"]:
     routes = st.session_state["routes"]
     r_idx = st.selectbox("מסלול (כיוון)", range(len(routes)), format_func=lambda i: routes[i]["label"])
-    route_key = routes[r_idx]["route_key"]
     line_ref = routes[r_idx]["line_ref"]
-    st.caption(f"route_key: `{route_key}` · line_ref (משמש לסינון בפועל): `{line_ref}`")
+    route_direction = routes[r_idx]["route_direction"]
+    st.caption(f"line_ref: `{line_ref}` · route_direction: `{route_direction}`")
 
     if st.button("🕐 טען שעות יציאה זמינות למסלול זה"):
         with st.spinner("טוען שעות יציאה מהימים האחרונים..."):
             try:
                 sample_date = datetime.now().date() - timedelta(days=1)
-                times, used_filter, n_rides = list_departure_times(
-                    operator_id, line_number, line_ref, sample_date,
-                    minimal=debug_minimal_query, bare=debug_bare_query
-                )
-                if not times:
-                    sample_date = datetime.now().date() - timedelta(days=2)
-                    times, used_filter, n_rides = list_departure_times(
-                        operator_id, line_number, line_ref, sample_date,
-                        minimal=debug_minimal_query, bare=debug_bare_query
-                    )
+                times, gtfs_route_id = list_departure_times(operator_id, line_number, line_ref, route_direction, sample_date)
+                tried_dates = [sample_date]
+                d_back = 2
+                while not times and d_back <= 10:
+                    sample_date = datetime.now().date() - timedelta(days=d_back)
+                    times, gtfs_route_id = list_departure_times(operator_id, line_number, line_ref, route_direction, sample_date)
+                    tried_dates.append(sample_date)
+                    d_back += 1
                 st.session_state["available_times"] = times
-                st.caption(f"סוג סינון שהצליח: `{used_filter}` · {n_rides} נסיעות חזרו מה-API בתאריך {sample_date}")
-                if used_filter == "route_short_name":
-                    st.info("⚠️ הסינון לפי line_ref לא נתמך/נכשל - הרשימה היא לכל הכיוונים של הקו יחד.")
-                elif used_filter == "minimal":
-                    st.info("זו שאילתת אבחון בלי סינון קו כלל - כל הנסיעות של המפעיל ביום הזה.")
+                if gtfs_route_id:
+                    st.caption(f"gtfs_route_id: `{gtfs_route_id}` · נבדק על תאריך {sample_date}")
                 if not times:
-                    st.warning("לא נמצאו שעות יציאה בימים האחרונים למסלול זה.")
+                    st.warning(f"לא נמצאו שעות יציאה ב-{len(tried_dates)} הימים האחרונים שנבדקו.")
             except Exception as e:
                 st.error(f"שגיאה בטעינת שעות: {e}")
-else:
-    line_ref = None
 
 departure_times = []
 if "available_times" in st.session_state and st.session_state["available_times"]:
@@ -322,11 +354,12 @@ departure_times_manual = st.text_input("או: הזן שעות יציאה ידנ�
 if departure_times_manual.strip():
     departure_times = [t.strip() for t in departure_times_manual.split(",") if t.strip()]
 
-max_workers = st.slider("מקביליות (מס' בקשות במקביל)", 1, 16, 8)
+max_workers = st.slider("מקביליות (מס' בקשות במקביל)", 1, 8, 4)
+st.caption("שים לב: מקביליות גבוהה מדי עלולה לגרום ל-500 מהשרת של Hasadna - מומלץ להתחיל נמוך.")
 
 st.divider()
 
-if st.button("▶️ התחל איסוף", type="primary", disabled=not (operator_id and line_number and departure_times)):
+if st.button("▶️ התחל איסוף", type="primary", disabled=not (operator_id and line_number and departure_times and line_ref)):
     today = datetime.now().date()
     start_date = today - timedelta(days=int(days_back))
     all_dates = [start_date + timedelta(days=i) for i in range((today - start_date).days)]
@@ -340,7 +373,7 @@ if st.button("▶️ התחל איסוף", type="primary", disabled=not (operato
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(collect_one, operator_id, line_number, line_ref, d, t): (d, t)
+            executor.submit(collect_one, operator_id, line_number, line_ref, route_direction, d, t): (d, t)
             for d, t in tasks
         }
         done = 0
@@ -367,7 +400,6 @@ if "collected_rows" in st.session_state:
     sqlite_bytes = build_sqlite_bytes(rows)
     st.download_button("⬇️ הורד כקובץ SQLite", data=sqlite_bytes, file_name="bus_gps_data.sql", mime="text/plain")
 
-    import csv
     csv_buf = io.StringIO()
     writer = csv.DictWriter(csv_buf, fieldnames=["line", "date", "scheduled_time", "status", "siri_ride_id", "gps_count", "gps_samples"])
     writer.writeheader()
