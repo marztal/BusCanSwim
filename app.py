@@ -322,20 +322,27 @@ if "routes" in st.session_state and st.session_state["routes"]:
     if st.button("🕐 טען שעות יציאה זמינות למסלול זה"):
         with st.spinner("טוען שעות יציאה מהימים האחרונים..."):
             try:
-                sample_date = datetime.now().date() - timedelta(days=1)
+                # מדלגים על שישי/שבת (weekday() 4=שישי, 5=שבת) - בהם יש לרוב
+                # שירות מצומצם/שונה משמעותית מיום חול רגיל
+                def prev_weekday(d):
+                    while d.weekday() in (4, 5):
+                        d -= timedelta(days=1)
+                    return d
+
+                sample_date = prev_weekday(datetime.now().date() - timedelta(days=1))
                 times, gtfs_route_id = list_departure_times(operator_id, line_number, line_ref, route_direction, sample_date)
                 tried_dates = [sample_date]
                 d_back = 2
-                while not times and d_back <= 10:
-                    sample_date = datetime.now().date() - timedelta(days=d_back)
+                while not times and d_back <= 14:
+                    sample_date = prev_weekday(datetime.now().date() - timedelta(days=d_back))
                     times, gtfs_route_id = list_departure_times(operator_id, line_number, line_ref, route_direction, sample_date)
                     tried_dates.append(sample_date)
                     d_back += 1
                 st.session_state["available_times"] = times
                 if gtfs_route_id:
-                    st.caption(f"gtfs_route_id: `{gtfs_route_id}` · נבדק על תאריך {sample_date}")
+                    st.caption(f"gtfs_route_id: `{gtfs_route_id}` · נבדק על תאריך {sample_date} (יום {['שני','שלישי','רביעי','חמישי','שישי','שבת','ראשון'][sample_date.weekday()]})")
                 if not times:
-                    st.warning(f"לא נמצאו שעות יציאה ב-{len(tried_dates)} הימים האחרונים שנבדקו.")
+                    st.warning(f"לא נמצאו שעות יציאה ב-{len(tried_dates)} ימי החול האחרונים שנבדקו.")
             except Exception as e:
                 st.error(f"שגיאה בטעינת שעות: {e}")
 
